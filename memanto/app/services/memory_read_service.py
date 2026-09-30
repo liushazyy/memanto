@@ -13,9 +13,10 @@ if TYPE_CHECKING:
 
 from memanto.app.clients.backend import get_active_llm_model
 from memanto.app.config import settings
-from memanto.app.constants import VALID_MEMORY_TYPES
+from memanto.app.constants import REMOVED_TRUST_FIELDS, VALID_MEMORY_TYPES
 from memanto.app.core import agent_namespace
-from memanto.app.utils.errors import MemoryError
+from memanto.app.services.activity_service import log_memory_activity
+from memanto.app.utils.errors import MemoryOperationError
 
 _FILTER_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
@@ -77,41 +78,38 @@ class MemoryReadService:
         return self._namespace_service
 
     def get_memory(self, memory_id: str, namespace: str) -> dict[str, Any] | None:
-        """Retrieve specific memory by ID with TTL enforcement"""
+        """Retrieve a specific memory by ID.
+
+        Expired memories are returned like any other, carrying their ``status``
+        and expiry stamp; it is the caller's job to label or filter them.
+        """
         try:
             result = self.client.documents.get(
                 namespace_name=namespace, ids=[memory_id]
             )
 
             if not isinstance(result, dict):
-                raise MemoryError(
+                raise MemoryOperationError(
                     message="Data corruption detected: Received malformed get result from storage layer.",
                     details={"result_preview": str(result)[:100]},
                 )
 
             items: Any = result.get("items", [])
             if not isinstance(items, list):
-                raise MemoryError(
+                raise MemoryOperationError(
                     message="Data corruption detected: Received malformed get items array from storage layer.",
                     details={"items_preview": str(items)[:100]},
                 )
 
             if items and len(items) > 0:
-                memory = self._format_memory_item(items[0])
-
-                # Apply TTL enforcement
-                filtered = self._filter_expired_memories([memory])
-                if filtered:
-                    return filtered[0]
-                else:
-                    return None  # Memory has expired
+                return self._format_memory_item(items[0])
 
             return None
 
-        except MemoryError:
+        except MemoryOperationError:
             raise
         except Exception as e:
-            raise MemoryError(f"Failed to retrieve memory: {e}")
+            raise MemoryOperationError(f"Failed to retrieve memory: {e}")
 
     def search_memories(
         self,
@@ -120,7 +118,7 @@ class MemoryReadService:
         type: list[str] | None = None,
         tags: list[str] | None = None,
         min_confidence: float | None = None,
-        status_filter: list[str] | None = None,
+        status: str = "all",
         limit: int = 10,
         offset: int = 0,
         min_similarity_score: float | None = None,
@@ -161,7 +159,6 @@ class MemoryReadService:
                     type=type_variant,
                     tags=tags,
                     min_confidence=min_confidence,
-                    status_filter=status_filter,
                     created_after=created_after,
                     created_before=created_before,
                     metadata_filters=metadata_filters,
@@ -173,21 +170,29 @@ class MemoryReadService:
             # Request extra results to handle offset (Moorcheh doesn't have native offset support)
             requested_limit = limit + offset
 
-            # Temporal, confidence, and TTL constraints are all enforced as
-            # post-processing on the rows the backend returns (see below), so
-            # the candidate pool we fetch must be large enough that those
-            # filters do not silently drop relevant rows. If we only fetched
-            # `limit + offset` rows, a date-scoped, confidence-scoped, or
-            # TTL-expired-heavy query would filter *within the top-N
-            # most-similar rows*, causing in-window memories that rank just
-            # outside the top-N to be lost entirely (timeline amnesia / poor
-            # recall). TTL enforcement (_filter_expired_memories) always runs
-            # below regardless of caller input, so we always over-fetch up to
-            # Moorcheh's hard cap rather than only when a temporal/confidence
-            # filter is explicitly requested.
-            top_k = min(
-                max(requested_limit, POST_FILTER_CANDIDATE_POOL), MOORCHEH_MAX_TOP_K
+            # Temporal, confidence, and lifecycle-status constraints are all
+            # enforced as post-processing on the rows the backend returns (see
+            # below), so the candidate pool we fetch must be large enough that
+            # those filters do not silently drop relevant rows. If we only
+            # fetched `limit + offset` rows, a date-scoped, confidence-scoped,
+            # or expired-heavy query would filter *within the top-N most-similar
+            # rows*, causing in-window memories that rank just outside the top-N
+            # to be lost entirely (timeline amnesia / poor recall).
+            # We over-fetch up to Moorcheh's hard cap only when a post-processing
+            # filter is actually requested to avoid the p95 latency penalty of
+            # over-fetching on simple recall queries.
+            needs_post_filter = (
+                created_after is not None
+                or created_before is not None
+                or min_confidence is not None
+                or status != "all"
             )
+            if needs_post_filter:
+                top_k = min(
+                    max(requested_limit, POST_FILTER_CANDIDATE_POOL), MOORCHEH_MAX_TOP_K
+                )
+            else:
+                top_k = min(requested_limit, MOORCHEH_MAX_TOP_K)
 
             # Perform search with server-side filtering.
             # Only enable kiosk_mode when the caller actually set a positive
@@ -226,7 +231,7 @@ class MemoryReadService:
                     try:
                         search_result = dict(search_result)
                     except (TypeError, ValueError):
-                        raise MemoryError(
+                        raise MemoryOperationError(
                             message=(
                                 "Data corruption detected: Received malformed "
                                 "search result from storage layer."
@@ -236,7 +241,7 @@ class MemoryReadService:
 
                 result_items = search_result.get("results", [])
                 if not isinstance(result_items, list):
-                    raise MemoryError(
+                    raise MemoryOperationError(
                         message=(
                             "Data corruption detected: Received malformed "
                             "search result array from storage layer."
@@ -283,8 +288,11 @@ class MemoryReadService:
                     created_before=created_before,
                 )
 
-            # Apply TTL enforcement - filter out expired memories
-            all_results = self._filter_expired_memories(all_results)
+            # Narrow to the requested lifecycle state. The `#status:` filter
+            # above already does this server-side for a single-status request,
+            # but records written before the lifecycle field carry no status,
+            # so re-apply it here to keep the two paths in agreement.
+            all_results = self._filter_by_status(all_results, status)
 
             if min_confidence is not None:
                 all_results = self._filter_by_min_confidence(
@@ -294,6 +302,10 @@ class MemoryReadService:
             # Apply pagination (offset + limit)
             paginated_results = all_results[offset : offset + limit]
             has_more = len(all_results) > offset + limit
+
+            log_memory_activity(
+                op="recall", agent_id=agent_id, count=len(paginated_results)
+            )
 
             return {
                 "results": paginated_results,
@@ -307,10 +319,10 @@ class MemoryReadService:
                 "execution_time": execution_time,
             }
 
-        except MemoryError:
+        except MemoryOperationError:
             raise
         except Exception as e:
-            raise MemoryError(f"Failed to search memories: {e}")
+            raise MemoryOperationError(f"Failed to search memories: {e}")
 
     def search_as_of(
         self,
@@ -325,7 +337,10 @@ class MemoryReadService:
 
         Returns memories that were:
         1. Created before or at as_of_date
-        2. NOT expired at as_of_date
+        2. Not yet expired at as_of_date
+
+        A memory expired *after* as_of_date is still returned, because it was
+        true at the point in time being asked about.
 
         Args:
             as_of_date: ISO timestamp for point-in-time (e.g., "2025-11-01T00:00:00Z")
@@ -355,7 +370,6 @@ class MemoryReadService:
                 namespaces,
                 type=type,
                 tags=tags,
-                filter_expired=False,
                 created_before=as_of_dt.isoformat(),
             )
             all_memories = self._apply_temporal_filter(
@@ -365,36 +379,42 @@ class MemoryReadService:
             # Filter to only include memories valid at as_of_date
             valid_memories = []
             for memory in all_memories:
-                # Skip if expired before as_of_date. Mirror the datetime
-                # handling in _filter_expired_memories so a datetime-valued
-                # expires_at cannot crash a historical recall (bounty #770).
-                expires_at = memory.get("expires_at")
-                if expires_at:
+                # Skip if the memory had already expired at as_of_date. A
+                # datetime-valued expired_at must not crash a historical recall
+                # (bounty #770), so both string and datetime forms are handled.
+                expired_at = memory.get("expired_at")
+                if expired_at:
                     try:
-                        if isinstance(expires_at, str):
-                            expires_dt = parse_iso_timestamp(expires_at)
-                        elif isinstance(expires_at, datetime):
-                            expires_dt = (
-                                expires_at
-                                if expires_at.tzinfo
-                                else expires_at.replace(tzinfo=timezone.utc)
+                        if isinstance(expired_at, str):
+                            expired_dt = parse_iso_timestamp(expired_at)
+                        elif isinstance(expired_at, datetime):
+                            expired_dt = (
+                                expired_at
+                                if expired_at.tzinfo
+                                else expired_at.replace(tzinfo=timezone.utc)
                             )
                         else:
-                            expires_dt = None  # Unknown type: fail open
-                        if expires_dt is not None and expires_dt <= as_of_dt:
+                            expired_dt = None  # Unknown type: fail open
+                        if expired_dt is not None and expired_dt <= as_of_dt:
                             continue  # Already expired at as_of_date
                     except (ValueError, AttributeError, TypeError):
-                        # Fail open: a malformed expires_at is not proof the
+                        # Fail open: a malformed expired_at is not proof the
                         # memory had expired at as_of. Falling through to the
                         # append below keeps it in the historical result rather
                         # than silently dropping it (timeline amnesia).
                         pass
 
+                # It was live at as_of even if it is expired now.
+                memory = {**memory, "status": "active"}
                 valid_memories.append(memory)
 
             # Apply limit
             if limit is not None:
                 valid_memories = valid_memories[:limit]
+
+            log_memory_activity(
+                op="recall", agent_id=agent_id, count=len(valid_memories)
+            )
 
             return {
                 "results": valid_memories,
@@ -404,7 +424,7 @@ class MemoryReadService:
             }
 
         except Exception as e:
-            raise MemoryError(f"Failed to perform as-of query: {e}")
+            raise MemoryOperationError(f"Failed to perform as-of query: {e}")
 
     def search_changed_since(
         self,
@@ -413,6 +433,7 @@ class MemoryReadService:
         type: list[str] | None = None,
         tags: list[str] | None = None,
         limit: int | None = 10,
+        status: str = "all",
     ) -> dict[str, Any]:
         """
         Differential retrieval: "What changed recently?"
@@ -435,7 +456,9 @@ class MemoryReadService:
             if not namespaces:
                 return {"results": [], "total_found": 0, "since_date": since_date}
 
-            all_memories = self._fetch_all_memories(namespaces, type=type, tags=tags)
+            all_memories = self._fetch_all_memories(
+                namespaces, type=type, tags=tags, status=status
+            )
 
             # Filter to only changed memories
             changed_memories = []
@@ -491,6 +514,10 @@ class MemoryReadService:
             if limit is not None:
                 changed_memories = changed_memories[:limit]
 
+            log_memory_activity(
+                op="recall", agent_id=agent_id, count=len(changed_memories)
+            )
+
             return {
                 "results": changed_memories,
                 "total_found": len(changed_memories),
@@ -499,7 +526,7 @@ class MemoryReadService:
             }
 
         except Exception as e:
-            raise MemoryError(f"Failed to search changed memories: {e}")
+            raise MemoryOperationError(f"Failed to search changed memories: {e}")
 
     def search_recent(
         self,
@@ -509,6 +536,7 @@ class MemoryReadService:
         limit: int | None = 10,
         created_after: str | None = None,
         created_before: str | None = None,
+        status: str = "all",
     ) -> dict[str, Any]:
         """
         Retrieve the most recently stored memories, sorted by created_at descending.
@@ -520,6 +548,7 @@ class MemoryReadService:
             limit: Max results to return
             created_after: ISO timestamp - include only memories created at/after this time
             created_before: ISO timestamp - include only memories created at/before this time
+            status: Lifecycle filter - ``all`` (default), ``active`` or ``expired``
         """
         try:
             from memanto.app.utils.temporal_helpers import parse_iso_timestamp
@@ -528,7 +557,9 @@ class MemoryReadService:
             if not namespaces:
                 return {"results": [], "total_found": 0}
 
-            unique_memories = self._fetch_all_memories(namespaces, type=type, tags=tags)
+            unique_memories = self._fetch_all_memories(
+                namespaces, type=type, tags=tags, status=status
+            )
 
             if created_after or created_before:
                 unique_memories = self._apply_temporal_filter(
@@ -550,18 +581,25 @@ class MemoryReadService:
 
             unique_memories.sort(key=_created_sort_key, reverse=True)
 
+            total_available = len(unique_memories)
             results = unique_memories if limit is None else unique_memories[:limit]
-            return {"results": results, "total_found": len(results)}
+            log_memory_activity(op="recall", agent_id=agent_id, count=len(results))
+
+            return {
+                "results": results,
+                "total_found": len(results),
+                "total_available": total_available,
+            }
 
         except Exception as e:
-            raise MemoryError(f"Failed to retrieve recent memories: {e}")
+            raise MemoryOperationError(f"Failed to retrieve recent memories: {e}")
 
     def _fetch_all_memories(
         self,
         namespaces: list[str],
         type: list[str] | None = None,
         tags: list[str] | None = None,
-        filter_expired: bool = True,
+        status: str = "all",
         created_before: str | None = None,
     ) -> list[dict[str, Any]]:
         """
@@ -572,12 +610,11 @@ class MemoryReadService:
         Iterates through all pages using cursor-based pagination (next_token)
         so results are not truncated at the 100-item per-page cap.
 
-        ``filter_expired`` controls whether memories expired at the current
-        wall-clock time are dropped. Point-in-time callers such as
-        ``search_as_of`` must pass ``filter_expired=False`` and apply their
-        own expiry check against the target date, otherwise memories that
-        were valid at that past date but have since expired are silently
-        dropped (timeline amnesia).
+        ``status`` narrows to one lifecycle state and defaults to ``all``.
+        Point-in-time callers such as ``search_as_of`` must leave it at ``all``
+        and apply their own expiry check against the target date, otherwise
+        memories that were valid at that past date but have since expired are
+        silently dropped (timeline amnesia).
 
         ``created_before`` drops any version whose ``created_at`` is after the
         given ISO timestamp *before* de-duplication, so point-in-time callers
@@ -597,6 +634,7 @@ class MemoryReadService:
         items: list[Any] = []
         for ns in namespaces:
             next_token: str | None = None
+            seen_tokens: set[str] = set()
             while True:
                 kwargs: dict[str, Any] = {"namespace_name": ns, "limit": 100}
                 if next_token:
@@ -609,8 +647,9 @@ class MemoryReadService:
                 if not pagination.get("has_more"):
                     break
                 next_token = pagination.get("next_token")
-                if not next_token:
+                if not next_token or next_token in seen_tokens:
                     break
+                seen_tokens.add(next_token)
 
         latest_by_id: dict[str, tuple[tuple[datetime, int], dict[str, Any]]] = {}
         for index, item in enumerate(items):
@@ -651,9 +690,7 @@ class MemoryReadService:
 
             memories.append(formatted)
 
-        if filter_expired:
-            return self._filter_expired_memories(memories)
-        return memories
+        return self._filter_by_status(memories, status)
 
     def _memory_version_key(
         self, memory: dict[str, Any], fetch_index: int
@@ -673,7 +710,7 @@ class MemoryReadService:
                 continue
             try:
                 return parse_iso_timestamp(str(raw)), fetch_index
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
         return fallback, fetch_index
 
@@ -683,7 +720,6 @@ class MemoryReadService:
         type: list[str] | None = None,
         tags: list[str] | None = None,
         min_confidence: float | None = None,
-        status_filter: list[str] | None = None,
         created_after: str | None = None,
         created_before: str | None = None,
         metadata_filters: dict[str, Any] | None = None,
@@ -691,10 +727,13 @@ class MemoryReadService:
         """
         Build enhanced query with Moorcheh's #key:value metadata filters
 
-        Example: "user authentication #memory_type:fact #status:active"
+        Example: "user authentication #memory_type:fact"
 
-        Note: Temporal filters (created_after/created_before) are applied as post-processing
-        since Moorcheh's metadata filters use string comparison
+        Note: Temporal, confidence, and lifecycle-status filters are applied as
+        post-processing. Status in particular must not be pushed down: records
+        written before the lifecycle field carry no ``status`` key at all, and a
+        server-side ``#status:active`` would drop them instead of treating them
+        as active.
         """
         filter_parts = []
 
@@ -712,12 +751,6 @@ class MemoryReadService:
                 tag = _validate_filter_token(tag, "tag")
                 filter_parts.append(f"#{tag}")
 
-        # Add status filters
-        if status_filter:
-            for status in status_filter:
-                status = _validate_filter_token(status, "status")
-                filter_parts.append(f"#status:{status}")
-
         # Numeric confidence is stored as a number in memory documents. Applying
         # it via Moorcheh keyword syntax would require exact categorical values
         # that are never written, so callers filter it after formatting results.
@@ -732,8 +765,10 @@ class MemoryReadService:
 
         # Combine query with filters
         if filter_parts:
-            return f"{query} {' '.join(filter_parts)}"
-        return query
+            base = (query or "").strip()
+            joined = " ".join(filter_parts)
+            return f"{base} {joined}".strip() if base else joined
+        return (query or "").strip()
 
     def _apply_temporal_filter(
         self,
@@ -801,66 +836,41 @@ class MemoryReadService:
             raw_confidence: Any = result.get("confidence")
             try:
                 confidence = float(raw_confidence)
-            except (TypeError, ValueError):
-                if min_confidence <= 0:
-                    filtered.append(result)
+            except (TypeError, ValueError, OverflowError):
+                # Fail open: include memories with unknown confidence rather
+                # than silently dropping them. This preserves imported memories
+                # that may not carry a confidence score.
+                filtered.append(result)
                 continue
             if confidence >= min_confidence:
                 filtered.append(result)
         return filtered
 
-    def _filter_expired_memories(
-        self, results: list[dict[str, Any]]
+    @staticmethod
+    def _filter_by_status(
+        results: list[dict[str, Any]], status: str
     ) -> list[dict[str, Any]]:
         """
-        Filter out memories that have expired based on their expires_at timestamp
+        Narrow results to one lifecycle state.
 
-        This provides application-level TTL enforcement since Moorcheh doesn't
-        automatically delete expired documents.
+        ``status="all"`` (the default everywhere) returns both active and
+        expired memories so callers can label them; expiry is surfaced to the
+        reader, not hidden from them. A record with no stored status predates
+        the lifecycle field and counts as active.
 
         Args:
             results: List of formatted memory items
+            status: One of ``all``, ``active``, ``expired``
 
         Returns:
-            Filtered list with expired memories removed
+            Filtered list
         """
+        if status == "all":
+            return results
 
-        from memanto.app.utils.temporal_helpers import parse_iso_timestamp
-
-        now = datetime.now(timezone.utc)
-
-        filtered = []
-        for result in results:
-            expires_at = result.get("expires_at")
-
-            # If no expiration set, keep the memory
-            if not expires_at:
-                filtered.append(result)
-                continue
-
-            # Parse and check expiration
-            try:
-                if isinstance(expires_at, str):
-                    expires_dt = parse_iso_timestamp(expires_at)
-                    # Only include if not expired
-                    if expires_dt > now:
-                        filtered.append(result)
-                elif isinstance(expires_at, datetime):
-                    tz_aware = (
-                        expires_at
-                        if expires_at.tzinfo
-                        else expires_at.replace(tzinfo=timezone.utc)
-                    )
-                    if tz_aware > now:
-                        filtered.append(result)
-                else:
-                    # Any other type: fail open - keep the memory
-                    filtered.append(result)
-            except (ValueError, AttributeError):
-                # If we can't parse, keep the memory (fail open)
-                filtered.append(result)
-
-        return filtered
+        return [
+            result for result in results if (result.get("status") or "active") == status
+        ]
 
     def generate_answer(
         self, query: str, agent_id: str | None = None
@@ -874,7 +884,7 @@ class MemoryReadService:
                 # Use first available namespace
                 namespaces = self.namespace_service.list_namespaces()
                 if not namespaces:
-                    raise MemoryError("No namespaces found")
+                    raise MemoryOperationError("No namespaces found")
                 namespace = namespaces[0]
 
             # Generate answer. Omit ai_model when on-prem state has no LLM
@@ -886,6 +896,8 @@ class MemoryReadService:
                 gen_kwargs["ai_model"] = _model
             answer_result = self.client.answer.generate(**gen_kwargs)
 
+            log_memory_activity(op="answer", agent_id=agent_id)
+
             return {
                 "answer": answer_result["answer"],
                 "namespace": namespace,
@@ -893,7 +905,7 @@ class MemoryReadService:
             }
 
         except Exception as e:
-            raise MemoryError(f"Failed to generate answer: {e}")
+            raise MemoryOperationError(f"Failed to generate answer: {e}")
 
     def _get_search_namespaces(self, agent_id: str | None = None) -> list[str]:
         """Get namespaces to search based on filters"""
@@ -941,7 +953,7 @@ class MemoryReadService:
         Format memory item for response.
         """
         if not isinstance(item, dict):
-            raise MemoryError(
+            raise MemoryOperationError(
                 message="Data corruption detected: Received malformed memory item from storage layer.",
                 details={"item_preview": str(item)[:100]},
             )
@@ -954,7 +966,7 @@ class MemoryReadService:
         # Check if metadata is in nested format (Moorcheh API spec)
         metadata = item.get("metadata", {})
         if not isinstance(metadata, dict):
-            raise MemoryError(
+            raise MemoryOperationError(
                 message="Data corruption detected: Received malformed metadata from storage layer.",
                 details={"item_preview": str(item)[:100]},
             )
@@ -1026,12 +1038,13 @@ class MemoryReadService:
                 "memory_type", "memory_type"
             ),  # Flat field name after migration
             "confidence": get_field("confidence"),
-            "status": get_field("status"),
+            # Records written before the lifecycle field carry no status.
+            "status": get_field("status") or "active",
             "tags": tags,
             "created_at": _coerce_timestamp_str(get_field("created_at")),
             "updated_at": _coerce_timestamp_str(get_field("updated_at")),
-            "expires_at": _coerce_timestamp_str(get_field("expires_at")),
-            "ttl_seconds": get_field("ttl_seconds"),
+            "expired_at": _coerce_timestamp_str(get_field("expired_at")),
+            "expired_by": get_field("expired_by"),
             "actor_id": get_field("actor_id"),
             "source": get_field("source"),
             "source_ref": get_field("source_ref"),
@@ -1040,6 +1053,19 @@ class MemoryReadService:
             # Provenance
             "provenance": provenance,
         }
+
+        # Preserve extra metadata keys (e.g. original_id) not in the schema.
+        # Exclude known keys, removed fields, and "memory_type" (duplicate of "type").
+        known_keys = set(formatted.keys()) | {"text", "memory_type", "metadata"}
+
+        extra_sources = [item]
+        if isinstance(metadata, dict):
+            extra_sources.append(metadata)
+
+        for source_dict in extra_sources:
+            for key, value in source_dict.items():
+                if key not in known_keys and key not in REMOVED_TRUST_FIELDS:
+                    formatted[key] = value
 
         return formatted
 

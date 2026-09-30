@@ -8,7 +8,7 @@ Uses extensive mocking to intercept API calls across all command modules.
 
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import jwt
 import pytest
@@ -281,6 +281,35 @@ class TestMEMANTOCLI:
         mock_all_clients.remember.assert_called_once()
         assert mock_all_clients.remember.call_args.kwargs["title"] == "Custom Title"
 
+    def test_remember_attributes_the_write_to_the_calling_tool(
+        self, mock_all_clients, monkeypatch
+    ):
+        """Without --source, the write is credited to the tool that ran it.
+
+        This is what makes the Connections view able to say which agent
+        produced which memory; a bare terminal still writes as "user".
+        """
+        mock_all_clients.remember.return_value = {"memory_id": "m1", "status": "queued"}
+        monkeypatch.setenv("CLAUDECODE", "1")
+
+        result = runner.invoke(app, ["remember", "Detected source memory"])
+
+        assert result.exit_code == 0
+        assert mock_all_clients.remember.call_args.kwargs["source"] == "claude-code"
+
+    def test_remember_source_flag_overrides_detection(
+        self, mock_all_clients, monkeypatch
+    ):
+        mock_all_clients.remember.return_value = {"memory_id": "m1", "status": "queued"}
+        monkeypatch.setenv("CLAUDECODE", "1")
+
+        result = runner.invoke(
+            app, ["remember", "Explicit source memory", "--source", "user"]
+        )
+
+        assert result.exit_code == 0
+        assert mock_all_clients.remember.call_args.kwargs["source"] == "user"
+
     def test_recall_displays_string_numeric_fields(self, mock_all_clients):
         """Recall output should not crash when API metadata numbers are strings."""
         mock_all_clients.recall.return_value = {
@@ -291,7 +320,6 @@ class TestMEMANTOCLI:
                     "content": "Prefers concise reports",
                     "type": "preference",
                     "confidence": "0.75",
-                    "computed_confidence": "0.66",
                     "score": "0.812",
                     "tags": ["ux"],
                 },
@@ -312,7 +340,7 @@ class TestMEMANTOCLI:
         assert result.exit_code == 0
         assert "Stored preference" in result.stdout
         assert "Stored fact" in result.stdout
-        assert "Confidence: 0.66 (computed) | Score: 0.812" in result.stdout
+        assert "Confidence: 0.75 | Score: 0.812" in result.stdout
         assert "Confidence: 0.41 | Score: 0.500" in result.stdout
 
     def test_edit(self, mock_all_clients):
@@ -564,6 +592,46 @@ class TestMEMANTOCLI:
                 )
 
         mock_write_service.batch_store_memories.assert_not_called()
+
+    @pytest.mark.parametrize("client_path", ["direct_client", "sdk_client"])
+    def test_batch_clients_preserve_temporal_metadata(
+        self, mock_all_clients, client_path
+    ):
+        """Migration writes must not turn expiring memories into permanent ones."""
+        if client_path == "direct_client":
+            from memanto.cli.client.direct_client import DirectClient as Client
+        else:
+            from memanto.cli.client.sdk_client import SdkClient as Client
+
+        mock_write_service = MagicMock()
+        mock_write_service.batch_store_memories.return_value = {"results": []}
+        mock_session = MagicMock()
+        mock_session.namespace = "memanto_agent_test-agent"
+        updated_at = datetime(2026, 6, 1, 9, 15, tzinfo=timezone.utc)
+
+        with (
+            patch.object(Client, "_get_write_service", return_value=mock_write_service),
+            patch.object(
+                Client,
+                "_get_validated_session_for_agent",
+                return_value=mock_session,
+            ),
+        ):
+            client = Client.__new__(Client)
+            client.api_key = "test-api-key"
+            client.session_token = None
+            client.batch_remember(
+                agent_id="test-agent",
+                memories=[
+                    {
+                        "content": "Temporary operational context",
+                        "updated_at": updated_at,
+                    }
+                ],
+            )
+
+        record = mock_write_service.batch_store_memories.call_args.args[0][0]
+        assert record.updated_at == updated_at
 
     def test_edit_sdk_normalizes_confidence_and_accepts_valid_payload(
         self, mock_all_clients
@@ -1199,6 +1267,7 @@ class TestMEMANTOCLI:
         mock_all_clients.generate_conflict_report.assert_called_once_with(
             agent_id="test-agent",
             date="2026-07-30",
+            on_progress=ANY,
         )
 
     def test_conflicts_list(self, mock_all_clients):
@@ -1307,6 +1376,51 @@ class TestMEMANTOCLI:
 
         assert _deleted_ids(mock_write) == ["A_old"]
 
+    @pytest.mark.parametrize(
+        "action,expected",
+        [
+            ("expire_old", ["A_old"]),
+            ("expire_new", ["A_new"]),
+            ("expire_both", ["A_old", "A_new"]),
+        ],
+    )
+    def test_expire_actions_retire_without_deleting(
+        self, tmp_path, monkeypatch, action, expected
+    ):
+        """The expire_* actions stamp the losing memory instead of deleting it."""
+        agent_id, date = "agent-1", "2026-07-01"
+        _write_conflict_report(tmp_path, agent_id, date, [_conflict("A")])
+        client, mock_write = _make_direct_client(tmp_path, monkeypatch)
+
+        client.resolve_conflict(agent_id, date, conflict_index=0, action=action)
+
+        expired = [call.args[0] for call in mock_write.set_lifecycle.call_args_list]
+        assert expired == expected
+        assert _deleted_ids(mock_write) == [], "expiring must not delete"
+
+        for call in mock_write.set_lifecycle.call_args_list:
+            assert call.kwargs["expired"] is True
+            assert call.kwargs["reason"] == "conflict-resolution"
+
+    def test_expire_action_marks_the_conflict_resolved(self, tmp_path, monkeypatch):
+        """An expiry resolves the conflict just like a delete does."""
+        agent_id, date = "agent-1", "2026-07-01"
+        _write_conflict_report(tmp_path, agent_id, date, [_conflict("A")])
+        client, _ = _make_direct_client(tmp_path, monkeypatch)
+
+        client.resolve_conflict(agent_id, date, conflict_index=0, action="expire_old")
+
+        assert client.list_conflicts(agent_id=agent_id, date=date) == []
+
+    def test_unknown_action_is_rejected(self, tmp_path, monkeypatch):
+        """A typo'd action must not silently do nothing."""
+        agent_id, date = "agent-1", "2026-07-01"
+        _write_conflict_report(tmp_path, agent_id, date, [_conflict("A")])
+        client, _ = _make_direct_client(tmp_path, monkeypatch)
+
+        with pytest.raises(ValueError, match="Invalid action"):
+            client.resolve_conflict(agent_id, date, conflict_index=0, action="expire")
+
     def test_memory_export(self, mock_all_clients):
         """Test 'memanto memory export'"""
         mock_all_clients.export_memory_md.return_value = {
@@ -1343,16 +1457,16 @@ class TestMEMANTOCLI:
 
         session_mock.assert_not_called()
 
-    def test_memory_sync(self, mock_all_clients):
+    @patch("memanto.cli.connect.updater.inject_dynamic_memories")
+    def test_memory_sync(self, mock_inject, mock_all_clients):
         """Test 'memanto memory sync'"""
-        mock_all_clients.sync_memory_to_project.return_value = {
-            "total_memories": 5,
-            "source": "cache",
-            "output_path": "project/memory.md",
+        mock_all_clients.recall.return_value = {
+            "memories": [{"type": "instruction", "content": "Test instruction"}] * 5
         }
+        mock_inject.return_value = {"updated": ["Injected successfully"]}
         result = runner.invoke(app, ["memory", "sync"])
         assert result.exit_code == 0
-        assert "Synced 5 memories" in result.stdout
+        assert "Recalled 5 dynamic memories" in result.stdout
 
     def test_schedule_commands(self, mock_all_clients):
         """Test schedule commands"""

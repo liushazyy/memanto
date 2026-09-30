@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from memanto.app.config import settings
 from memanto.app.services.session_service import get_session_service
 from memanto.app.utils.errors import InvalidSessionTokenError, SessionExpiredError
 
@@ -65,9 +66,10 @@ session_app = typer.Typer(help="Legacy aliases for agent activation commands")
 config_app = typer.Typer(help="Configuration commands")
 schedule_app = typer.Typer(help="Daily summary scheduling commands")
 memory_app = typer.Typer(help="Memory management commands")
+policy_app = typer.Typer(help="Memory expiry policy commands")
 connect_app = typer.Typer(help="Connect MEMANTO to external tools")
 migrate_app = typer.Typer(
-    help="Migrate memories from other providers (Mem0/Letta/Supermemory) into Memanto"
+    help="Migrate memories from other providers (Mem0/Letta/Supermemory/Zep/Hindsight) into Memanto"
 )
 
 app.add_typer(agent_app, name="agent")
@@ -75,6 +77,7 @@ app.add_typer(session_app, name="session")
 app.add_typer(config_app, name="config")
 app.add_typer(schedule_app, name="schedule")
 app.add_typer(memory_app, name="memory")
+app.add_typer(policy_app, name="policy")
 app.add_typer(connect_app, name="connect")
 app.add_typer(migrate_app, name="migrate")
 
@@ -117,16 +120,19 @@ def get_client() -> SdkClient:
 
     # Restore active session if available
     active_agent_id, active_session_token = config_manager.get_active_session()
-    session_cfg = config_manager.get_session_config()
 
     if active_session_token and active_agent_id:
         client.session_token = active_session_token
         client.agent_id = active_agent_id
 
-        # Validate the stored token (signature + expiry) and silently re-activate
-        # when auto-renew is enabled. The old expiry-only check missed invalid
-        # signatures, which broke analyze LLM narratives mid-run.
-        if session_cfg.get("auto_renew_enabled", True):
+        # Expiry is already handled upstream: get_active_session() auto-recreates
+        # a lapsed session, so the token above is fresh. What remains here is a
+        # token that no longer verifies at all - typically a rotated
+        # MEMANTO_SECRET_KEY - which used to break analyze LLM narratives
+        # mid-run. Gate it on the same single toggle as every other path
+        # (settings, which config.yaml feeds) rather than re-reading the YAML,
+        # so turning auto-recreate off disables it everywhere.
+        if settings.SESSION_AUTO_RECREATE_ENABLED:
             session_service = get_session_service()
             needs_reactivate = False
             try:

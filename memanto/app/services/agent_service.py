@@ -23,6 +23,7 @@ from memanto.app.utils.errors import (
     AgentAlreadyExistsError,
     AgentNamespaceConflictError,
     AgentNotFoundError,
+    NamespaceError,
 )
 from memanto.app.utils.temporal_helpers import as_utc_aware
 from memanto.app.utils.validation import validate_safe_id
@@ -120,6 +121,8 @@ class AgentService:
                 )
             except Exception as exc:
                 message = str(exc).lower()
+                if "limit" in message or "tier" in message or "quota" in message:
+                    raise NamespaceError(f"Moorcheh namespace limit reached: {exc}")
                 if (
                     "namespace" in message and "already exists" in message
                 ) or "conflict" in message:
@@ -129,9 +132,9 @@ class AgentService:
                         "pre-existing namespace (possible cross-tenant memory poisoning)"
                     )
                 else:
-                    raise Exception(
+                    raise NamespaceError(
                         f"Failed to create namespace '{namespace}' in Moorcheh: {exc}"
-                    )
+                    ) from exc
 
             agent = AgentInfo(
                 agent_id=agent_create.agent_id,

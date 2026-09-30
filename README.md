@@ -92,7 +92,7 @@ This is the part that matters in two years, and it's the part every platform-nat
 
 **Your estate is a file.** `memanto memory export --okf` gives you the [Open Knowledge Format](https://docs.memanto.ai/integrations/okf) — plain Markdown, readable, diffable, committable, greppable. Not a proprietary dump you can technically request. The actual working format.
 
-**It moves.** `memanto migrate` imports from Mem0, Letta, Supermemory, or any OKF bundle. The same command works in reverse. OKF is an open interchange format any framework or vendor can implement — including ours' competitors, deliberately.
+**It moves.** `memanto migrate` imports from Mem0, Letta, Supermemory, Zep, Hindsight, or any OKF bundle. The same command works in reverse. OKF is an open interchange format any framework or vendor can implement — including ours' competitors, deliberately.
 
 **It runs on your machine.** Local Docker + Ollama, no account, no API key, nothing leaves your infrastructure. Or free cloud, or your own hosting. `memanto config backend` switches between them in one command, and the estate comes with you.
 
@@ -114,7 +114,48 @@ There is no lock-in because there is nothing to lock.
 
 **Scoped by default.** Each agent gets its own namespace. Your production-ops agent doesn't read your scratch experiments; you provision exactly what each one should know and nothing more.
 
-**Every belief is traceable.** Confidence score, source, timestamp, and what it superseded. When an agent acts on something, you can walk back to where that belief entered the fleet and when — which is the difference between an auditable estate and a black box.
+**Every belief is traceable.** Confidence score, source, provenance, and timestamp. When an agent acts on something, you can walk back to where that belief entered the fleet and when — which is the difference between an auditable estate and a black box.
+
+**Forgetting is a decision you make, not a side effect.** A memory is `active` or `expired` — nothing else. It becomes expired only because a policy you wrote says so, and it carries the date and the rule name that did it. Expired memories still recall, clearly labelled, and `memanto memory restore` puts one back. Deleting is a separate, explicit act.
+
+---
+
+## Memory that expires on your terms
+
+Every memory is **active** until a policy retires it. Expiry is stamped, auditable, and reversible — the content survives, and the memory keeps showing up in recall marked `[EXPIRED]` with the reason it aged out.
+
+```bash
+memanto policy list-preset          # conservative / balanced / aggressive
+memanto policy apply-preset balanced  # shows it in full, then asks
+memanto policy apply --dry-run      # exactly what would expire, per rule
+memanto policy apply                # shows the policy + matches, then confirms
+```
+
+Policies live in `~/.memanto/policies/<agent>.yaml` and have two halves — a per-type retention table for broad strokes, and named rules for everything sharper. The first matching rule wins, so a rule can also *pin* a memory that the table would otherwise expire:
+
+```yaml
+retention:
+  context: 7d
+  event: 30d
+  preference: never          # durable user truths don't age out
+rules:
+  - name: pinned
+    match: {tags: [pinned]}
+    expire_after: never      # an explicit pin beats the table
+  - name: low-confidence-guesses
+    match: {provenance: [inferred], confidence_below: 0.5}
+    expire_after: 14d
+purge_expired_after: never   # optional hard delete, off by default
+```
+
+Recall shows both states side by side; narrow with `--active` or `--expired`. Point-in-time recall is unaffected — `--as-of` still reconstructs what was true then, including memories that have expired since.
+
+```bash
+memanto memory expire mem-123       # retire one by hand
+memanto memory restore mem-123      # and put it back
+```
+
+The nightly job (`memanto schedule enable`) runs the sweep for you. An agent with no policy set never expires anything.
 
 ---
 
@@ -173,7 +214,7 @@ Storage substrates sit *beneath* Memanto — vector stores, filesystems, and pla
 | Daily intelligence | `memanto daily-summary`, `memanto conflicts` | Summaries, contradiction detection, interactive resolution. |
 | Sessions & automation | `memanto session ...`, `memanto schedule ...` | Inspect sessions, enable scheduled daily runs. |
 | Estate export & sync | `memanto memory export`, `memanto memory sync` | Export structured Markdown, sync `MEMORY.md` into projects. `--okf` for a portable [OKF](https://docs.memanto.ai/integrations/okf) bundle. |
-| Import & migration | `memanto migrate` | Import from Mem0, Letta, Supermemory, or an OKF bundle. |
+| Import & migration | `memanto migrate` | Import from Mem0, Letta, Supermemory, Zep, Hindsight, or an OKF bundle. |
 | Configuration | `memanto config show` | API key status, active agent/session, server settings, schedule time. |
 | Fleet integration | `memanto connect ...` | Claude Code, Codex, Cursor, Windsurf, Antigravity, Gemini CLI, Cline, Continue, OpenCode, Goose, Roo, GitHub Copilot, Augment. |
 
@@ -288,7 +329,7 @@ A caveat we'd rather say out loud: cross-project scores on these benchmarks are 
 
 <p align="center">
   <a href="https://trendshift.io/repositories/27378"><img src="https://trendshift.io/api/badge/repositories/27378" alt="Trendshift" width="220"></a>
-  <a href="https://mcptoplist.com/server/glama%2Fmoorcheh-ai%2Fmemanto"><img src="https://mcptoplist.com/badge/glama%2Fmoorcheh-ai%2Fmemanto.svg" alt="MCP Top List" width="220"></a>
+  <!-- <a href="https://mcptoplist.com/server/glama%2Fmoorcheh-ai%2Fmemanto"><img src="https://mcptoplist.com/badge/glama%2Fmoorcheh-ai%2Fmemanto.svg" alt="MCP Top List" width="220"></a> -->
   <a href="https://deepwiki.com/moorcheh-ai/memanto"><img alt="DeepWiki" src="https://deepwiki.com/badge.svg"></a>
 </p>
 
